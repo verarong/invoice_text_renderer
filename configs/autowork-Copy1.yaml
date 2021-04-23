@@ -1,0 +1,196 @@
+# Small font_size will make text looks like blured/prydown
+font_size:
+  min: 20
+  max: 52
+
+# choose font_color range
+# color boundary is in R,G,B format
+font_color:
+  gray:
+    fraction: 1
+    l_boundary: 250,250,250
+    h_boundary: 255,255,255
+    
+# second font in one line
+# choose what's different from first font
+
+second_font:
+  enable: true
+  fraction: 0.05
+  change_rate: 0.3
+  font_change: false
+  font_size_change: true
+  font_color_change: false
+
+# choose line_color range
+# color boundary is in R,G,B format
+line_color:
+  black:
+    fraction: 0.20
+    l_boundary: 30,30,30
+    h_boundary: 64,64,64
+  gray:
+    fraction: 0.80
+    l_boundary: 77,77,77
+    h_boundary: 255,255,255
+
+# By default, text is drawed by Pillow with (https://stackoverflow.com/questions/43828955/measuring-width-of-text-python-pil)
+# If `random_space` is enabled, some text will be drawed char by char with a random space
+random_space:
+  enable: true
+  fraction: 0.3
+  min: -0.15 # -0.1 will make chars very close or even overlapped
+  max: 0.15
+
+# draw extra random words on top or bottom of the img
+extra_words:
+  enable: true
+  fraction: 0.1
+  top:
+    fraction: 0.5
+  bottom:
+    fraction: 0.5
+
+# Do remap with sin()
+# Currently this process is very slow!
+curve:
+  enable: false
+  fraction: 0.3
+  period: 360  # degree, sin 函数的周期
+  min: 1 # sin 函数的幅值范围
+  max: 5
+
+# random crop text height
+crop:
+  enable: true
+  fraction: 0.5
+
+  # top and bottom will applied equally
+  top:
+    min: 5
+    max: 15 # in pixel, this value should small than img_height
+  bottom:
+    min: 5
+    max: 15 # in pixel, this value should small than img_height
+
+# Use image in bg_dir as background for text
+img_bg:
+  enable: true
+  fraction: 0.8
+
+# Not work when random_space applied
+text_border:
+  enable: false
+  fraction: 0.1
+
+  # lighter than word color
+  light:
+    enable: true
+    fraction: 0.5
+
+  # darker than word color
+  dark:
+    enable: true
+    fraction: 0.5
+
+# https://docs.opencv.org/3.4/df/da0/group__photo__clone.html#ga2bf426e4c93a6b1f21705513dfeca49d
+# https://www.cs.virginia.edu/~connelly/class/2014/comp_photo/proj2/poisson.pdf
+# Use opencv seamlessClone() to draw text on background
+# For some background image, this will make text image looks more real
+seamless_clone:
+  enable: false
+  fraction: 0.5
+
+perspective_transform:
+  max_x: 25
+  max_y: 25
+  max_z: 3
+
+blur:
+  enable: true
+  fraction: 0.1
+
+  gauss:
+    enable: true
+    fraction: 0.25
+  
+  norm:
+    enable: true
+    fraction: 0.25
+
+  motion:
+    enable: true
+    fraction: 0.25
+
+  prydown:
+    enable: true
+    fraction: 0.25
+    max_scale: 1.5
+  
+
+texture:
+  enable: false
+  fraction: 0.10
+
+  cloud:
+    enable: true
+    fraction: 1
+    octaves: 2
+    persistence: 0.4
+    scale : 2000
+
+
+noise:
+  enable: true
+  fraction: 0.03
+
+  gauss:
+    enable: true
+    fraction: 0.25
+
+  uniform:
+    enable: true
+    fraction: 0.25
+
+  salt_pepper:
+    enable: true
+    fraction: 0.25
+
+  poisson:
+    enable: true
+    fraction: 0.25
+
+line:
+  enable: true
+  fraction: 0.1
+
+  under_line:
+    enable: true
+    fraction: 0.1
+
+  table_line:
+    enable: true
+    fraction: 0.8
+    random_offset: true # line will cross chars
+
+  middle_line:
+    enable: true
+    fraction: 0.1
+
+# These operates are applied on the final output image,
+# so actually it can also be applied in training process as an data augmentation method.
+
+# By default, text is darker than background.
+# If `reverse_color` is enabled, some images will have dark background and light text
+reverse_color:
+  enable: true
+  fraction: 0
+
+emboss:
+  enable: false
+  fraction: 0.1
+
+sharp:
+  enable: false
+  fraction: 0.1
+

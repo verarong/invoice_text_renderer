@@ -1,0 +1,766 @@
+import math
+import random
+import numpy as np
+import cv2
+from PIL import ImageFont, Image, ImageDraw
+from tenacity import retry
+import os
+import time
+
+import libs.math_utils as math_utils
+from libs.utils import draw_box, draw_bbox, prob, apply
+from libs.timer import Timer
+from textrenderer.liner import Liner
+from textrenderer.noiser import Noiser, Texture
+import libs.font_utils as font_utils
+
+# noinspection PyMethodMayBeStatic
+from textrenderer.remaper import Remaper
+
+
+def debug(fn):
+    def wrapper(*args, **kwargs):
+        start = time.time()
+        try:
+            score = fn(*args, **kwargs)
+            print("{} cost {}".format(fn.__name__, time.time() - start))
+            return score
+        except Exception as e:
+            print("{} except {}".format(fn.__name__, repr(e)))
+
+    return wrapper
+
+
+class Renderer(object):
+    def __init__(self, corpus, fonts, bgs, cfg, width=256, height=32,
+                 clip_max_chars=False, debug=False, gpu=False, strict=False, fonts_by_image=False):
+        self.corpus = corpus
+        self.fonts = fonts
+        self.bgs = bgs
+        self.out_width = width
+        self.out_height = height
+        self.clip_max_chars = clip_max_chars
+        self.max_chars = math.floor(width / 4) - 1
+        self.debug = debug
+        self.gpu = gpu
+        self.strict = strict
+        self.cfg = cfg
+        self.fonts_by_image = fonts_by_image
+
+        self.timer = Timer()
+        self.liner = Liner(cfg)
+        self.noiser = Noiser(cfg)
+        self.texture = Texture(cfg)
+        self.remaper = Remaper(cfg)
+        self.start = time.time()
+
+        self.create_kernals()
+
+        if self.strict:
+            self.font_unsupport_chars = font_utils.get_unsupported_chars(
+                self.fonts, corpus.chars_file, self.fonts_by_image)
+
+    def gen_img(self, img_index):
+        # print(0, time.time() - self.start)
+        word, font, word_size, font2, font_size = self.pick_font(img_index)
+        # print(1, time.time() - self.start)
+        self.dmsg("after pick font")
+
+        # Background's height should much larger than raw word image's height,
+        # to make sure we can crop full word image after apply perspective
+        bg = self.gen_bg(width=word_size[0] * 8, height=word_size[1] * 8)
+        word_img, text_box_pnts, word_color = self.draw_text_on_bg(
+            word, font, bg, font2, font_size)
+        self.dmsg("After draw_text_on_bg")
+
+        # print(2, time.time() - self.start)
+        if apply(self.cfg.crop):
+            text_box_pnts = self.apply_crop(text_box_pnts, self.cfg.crop)
+
+        # print(3, time.time() - self.start)
+        if apply(self.cfg.line):
+            word_img, text_box_pnts = self.liner.apply(word_img, text_box_pnts)
+            self.dmsg("After draw line")
+
+        # print(4, time.time() - self.start)
+        if self.debug:
+            word_img = draw_box(word_img, text_box_pnts, (0, 255, 155))
+
+        # print(5, time.time() - self.start)
+        if apply(self.cfg.curve):
+            word_img, text_box_pnts = self.remaper.apply(
+                word_img, text_box_pnts, word_color)
+            self.dmsg("After remapping")
+
+        # print(6, time.time() - self.start)
+        if self.debug:
+            word_img = draw_box(word_img, text_box_pnts, (155, 255, 0))
+
+        # print(7, time.time() - self.start)
+        word_img = self.mix_seamless_bg(word_img, bg)
+        if apply(self.cfg.extra_words):
+            word_img = self.draw_extra_random_word(
+                word_img, text_box_pnts, img_index)
+            self.dmsg("After add extra words")
+
+        word_img, img_pnts_transformed, text_box_pnts_transformed = \
+            self.apply_perspective_transform(word_img, text_box_pnts,
+                                             max_x=self.cfg.perspective_transform.max_x,
+                                             max_y=self.cfg.perspective_transform.max_y,
+                                             max_z=self.cfg.perspective_transform.max_z,
+                                             gpu=self.gpu)
+
+        self.dmsg("After perspective transform")
+
+        # print(8, time.time() - self.start)
+        if self.debug:
+            _, crop_bbox = self.crop_img(word_img, text_box_pnts_transformed)
+            word_img = draw_bbox(word_img, crop_bbox, (255, 0, 0))
+        else:
+            word_img, crop_bbox = self.crop_img(
+                word_img, text_box_pnts_transformed)
+
+        self.dmsg("After crop_img")
+
+        # print(9, time.time() - self.start)
+        if apply(self.cfg.noise):
+            word_img = np.clip(word_img, 0., 255.)
+            word_img = self.noiser.apply(word_img)
+            self.dmsg("After noiser")
+
+        # print(10, time.time() - self.start)
+        if apply(self.cfg.blur):
+            word_img = self.apply_blur_on_output(word_img)
+            self.dmsg("After blur")
+
+        word_img = np.clip(word_img, 0., 255.)
+
+        # print(11, time.time() - self.start)
+        if apply(self.cfg.reverse_color):
+            word_img = self.reverse_img(word_img)
+            self.dmsg("After reverse_img")
+
+        # print(12, time.time() - self.start)
+        if apply(self.cfg.emboss):
+            word_img = self.apply_emboss(word_img)
+            self.dmsg("After emboss")
+
+        # print(13, time.time() - self.start)
+        if apply(self.cfg.sharp):
+            word_img = self.apply_sharp(word_img)
+            self.dmsg("After sharp")
+
+        return word_img, word
+
+    def dmsg(self, msg):
+        if self.debug:
+            print(msg)
+
+    def random_xy_offset(self, src_height, src_width, dst_height, dst_width):
+        """
+        Get random left-top point for putting a small rect in a large rect.
+        Normally dst_height>src_height and dst_width>src_width
+        """
+        y_max_offset = 0
+        if dst_height > src_height:
+            y_max_offset = dst_height - src_height
+
+        x_max_offset = 0
+        if dst_width > src_width:
+            x_max_offset = dst_width - src_width
+
+        y_offset = 0
+        if y_max_offset != 0:
+            y_offset = random.randint(0, y_max_offset)
+
+        x_offset = 0
+        if x_max_offset != 0:
+            x_offset = random.randint(0, x_max_offset)
+
+        return x_offset, y_offset
+
+    # @debug
+    def crop_img(self, img, text_box_pnts_transformed):
+        """
+        Crop text from large input image
+        :param img: image to crop
+        :param text_box_pnts_transformed: text_bbox_pnts after apply_perspective_transform
+        :return:
+            dst: image with desired output size, height=32, width=flags.img_width
+            crop_bbox: bounding box on input image
+        """
+        bbox = cv2.boundingRect(text_box_pnts_transformed)
+        bbox_width = bbox[2]
+        bbox_height = bbox[3]
+
+        # Output shape is (self.out_width, self.out_height)
+        # We randomly put bounding box of transformed text in the output shape
+        # so the max value of dst_height is out_height
+
+        # TODO: If rotate angle(z) of text is too big, text will become very small,
+        # we should do something to prevent text too small
+
+        # dst_height and dst_width is used to leave some padding around text bbox
+        dst_height = random.randint(self.out_height // 4 * 3, self.out_height)
+
+        if self.out_width == 0:
+            scale = bbox_height / dst_height
+        else:
+            dst_width = self.out_width
+            scale = max(bbox_height / dst_height, bbox_width / self.out_width)
+
+        s_bbox_width = math.ceil(bbox_width / scale)
+        s_bbox_height = math.ceil(bbox_height / scale)
+
+        if self.out_width == 0:
+            padding = random.randint(s_bbox_width // 10, s_bbox_width // 8)
+            dst_width = s_bbox_width + padding * 2
+
+        s_bbox = (np.around(bbox[0] / scale),
+                  np.around(bbox[1] / scale),
+                  np.around(bbox[2] / scale),
+                  np.around(bbox[3] / scale))
+
+        x_offset, y_offset = self.random_xy_offset(
+            s_bbox_height, s_bbox_width, self.out_height, dst_width)
+
+        dst_bbox = (
+            self.int_around((s_bbox[0] - x_offset) * scale),
+            self.int_around((s_bbox[1] - y_offset) * scale),
+            self.int_around(dst_width * scale),
+            self.int_around(self.out_height * scale)
+        )
+
+        # It's important do crop first and than do resize for speed consider
+        dst = img[dst_bbox[1]:dst_bbox[1] + dst_bbox[3],
+              dst_bbox[0]:dst_bbox[0] + dst_bbox[2]]
+
+        dst = cv2.resize(dst, (dst_width, self.out_height),
+                         interpolation=cv2.INTER_CUBIC)
+
+        return dst, dst_bbox
+
+    def int_around(self, val):
+        return int(np.around(val))
+
+    def get_word_color(self):
+        colors = [i for i in self.cfg.font_color]
+        p = [self.cfg.font_color[i].fraction for i in self.cfg.font_color]
+        # pick color by fraction
+        color_name = np.random.choice(colors, p=p)
+        l_boundary = [
+            int(i) for i in self.cfg.font_color[color_name].l_boundary.split(',')]
+        h_boundary = [
+            int(i) for i in self.cfg.font_color[color_name].h_boundary.split(',')]
+        # random color by low and high RGB boundary
+        if color_name == 'black' or color_name == 'gray':
+            r = g = b = np.random.randint(l_boundary[0], h_boundary[0])
+        else:
+            r = np.random.randint(l_boundary[0], h_boundary[0])
+            g = np.random.randint(l_boundary[1], h_boundary[1])
+            b = np.random.randint(l_boundary[2], h_boundary[2])
+        return (b, g, r)
+
+    # @debug
+    def draw_text_on_bg(self, word, font, bg, font2, font_size):
+        """
+        Draw word in the center of background
+        :param word: word to draw
+        :param font: font to draw word
+        :param bg: background numpy image
+        :return:
+            np_img: word image
+            text_box_pnts: left-top, right-top, right-bottom, left-bottom
+        """
+        bg_height = bg.shape[0]
+        bg_width = bg.shape[1]
+
+        word_size = self.get_word_size(font, word, font_size)
+        word_height = word_size[1]
+        word_width = word_size[0]
+
+        offset = (0, 0) if self.fonts_by_image else font.getoffset(word)
+        pure_bg = np.ones((bg_height, bg_width, 3)) * 255
+
+        pil_img = Image.fromarray(np.uint8(pure_bg))
+        draw = ImageDraw.Draw(pil_img)
+        # print("pure_bg", pure_bg.shape)
+        # Draw text in the center of bg
+        text_x = int((bg_width - word_width) / 2)
+        text_y = int((bg_height - word_height) / 2)
+
+        word_color = self.get_word_color()
+        # cv2.imwrite("/media/ruijun/新加卷/workspace/text_renderer/debug/debug.png", np.array(pil_img).astype(np.float32))
+        # print(self.cfg)
+        if apply(self.cfg.random_space):
+            # print(time.time() - self.start, "bingo")
+            text_x, text_y, word_width, word_height, pil_img_ = self.draw_text_with_random_space(draw, font, word,
+                                                                                                 word_color,
+                                                                                                 bg_width, bg_height,
+                                                                                                 pure_bg)
+        else:
+            if apply(self.cfg.texture):
+                # print(time.time() - self.start, "aluba")
+                pure_bg = Image.new(
+                    'RGBA', (bg_width, bg_height), (255, 255, 255, 255))
+                pil_img = Image.new(
+                    'RGBA', (bg_width, bg_height), (255, 255, 255, 0))
+                draw = ImageDraw.Draw(pil_img)
+                pil_img_ = self.draw_text_wrapper(
+                    draw, word, text_x - offset[0], text_y - offset[1], font, word_color, font2, pure_bg)
+                pil_img = self.texture.apply_cloud_texture(pure_bg, pil_img)
+            else:
+                # print(time.time() - self.start, "axiba")
+                pil_img_ = self.draw_text_wrapper(
+                    draw, word, text_x - offset[0], text_y - offset[1], font, word_color, font2, pure_bg)
+            # draw.text((text_x - offset[0], text_y - offset[1]), word, fill=word_color, font=font)
+        # cv2.imwrite("/media/ruijun/新加卷/workspace/text_renderer/debug/debug1.png", np.array(pil_img).astype(np.float32))
+        if self.fonts_by_image:
+            np_img = np.array(pil_img_).astype(np.float32)
+        else:
+            np_img = np.array(pil_img).astype(np.float32)
+
+        text_box_pnts = [
+            [text_x, text_y],
+            [text_x + word_width, text_y],
+            [text_x + word_width, text_y + word_height],
+            [text_x, text_y + word_height]
+        ]
+
+        return np_img, text_box_pnts, word_color
+
+    # @debug
+    def mix_seamless_bg(self, text_img, bg, anchor=None):
+        text_img = np.array(text_img).astype(np.uint8)
+        text_mask = 255 * np.ones(text_img.shape, text_img.dtype)
+        if self.fonts_by_image and anchor:
+            h, w = text_img.shape[:2]
+            center = (int(anchor[0] + w / 2), int(anchor[1] + h / 2))
+            bg = bg.astype(np.uint8)
+        else:
+            center = (bg.shape[1] // 2, bg.shape[0] // 2)
+        # print("center",center)
+        # print("bg.shape",bg.shape)
+        # print("text_img.shape", text_img.shape)
+        mixed_clone = cv2.seamlessClone(
+            text_img, bg, text_mask, center, cv2.MIXED_CLONE)
+        return mixed_clone
+
+    # @debug
+    def draw_extra_random_word(self, text_img, text_box_pnts, img_index):
+        pil_img = Image.fromarray(np.uint8(text_img))
+        draw = ImageDraw.Draw(pil_img)
+        word_color = self.get_word_color()
+        word, font, word_size, font2, font_size = self.pick_font(img_index)
+        word_len = np.random.randint(1, len(word))
+        word_height = word_size[1]
+        word_width = word_size[0]
+        # calculate text x,y
+        text_x = np.random.randint(text_box_pnts[0][0], text_box_pnts[1][0])
+        text_y_b = text_box_pnts[2][1]
+        text_y_t = 2 * text_box_pnts[0][1] - \
+                   text_box_pnts[2][1] - word_height * 0.5
+        text_y = np.random.choice([text_y_t, text_y_b],
+                                  p=[self.cfg.extra_words.top.fraction, self.cfg.extra_words.bottom.fraction])
+        self.draw_text_wrapper(
+            draw, word[:word_len], text_x, text_y, font, word_color, font2, font_size, np.uint8(text_img))
+        np_img = np.array(pil_img).astype(np.float32)
+        return np_img
+
+    def draw_text_with_random_space(self, draw, font, word, word_color, bg_width, bg_height, pil_img):
+        """ If random_space applied, text_x, text_y, word_width, word_height may change"""
+        width = 0
+        height = 0
+        chars_size = []
+        y_offset = 10 ** 5
+        for c in word:
+            if self.fonts_by_image:
+                size = font[c].shape[:2]
+            else:
+                size = font.getsize(c)
+            chars_size.append(size)
+
+            width += size[0]
+            # set max char height as word height
+            if size[1] > height:
+                height = size[1]
+
+            # Min chars y offset as word y offset
+            # Assume only y offset
+            c_offset = (0, 0) if self.fonts_by_image else font.getoffset(c)
+            if c_offset[1] < y_offset:
+                y_offset = c_offset[1]
+
+        char_space_width = int(
+            height * np.random.uniform(self.cfg.random_space.min, self.cfg.random_space.max))
+
+        width += (char_space_width * (len(word) - 1))
+
+        text_x = int((bg_width - width) / 2)
+        text_y = int((bg_height - height) / 2)
+
+        c_x = text_x
+        c_y = text_y
+
+        for i, c in enumerate(word):
+            # self.draw_text_wrapper(draw, c, c_x, c_y - y_offset, font, word_color, force_text_border)
+            if self.fonts_by_image:
+                pil_img = self.mix_seamless_bg(font[c], pil_img, (c_x, c_y - y_offset))
+            else:
+                draw.text((c_x, c_y - y_offset), c, fill=word_color, font=font)
+
+            c_x += (chars_size[i][0] + char_space_width)
+
+        return text_x, text_y, width, height, pil_img
+
+    def draw_text_wrapper(self, draw, text, x, y, font, text_color, font2, pil_img):
+        """
+        :param x/y: 应该是移除了 offset 的
+        """
+        if apply(self.cfg.text_border):
+            # print("error")
+            self.draw_border_text(draw, text, x, y, font, text_color)
+
+        # todo: 整合draw_text_wrapper 与 draw_text_with_random_space
+        elif apply(self.cfg.second_font):
+            if self.cfg.second_font.font_color_change:
+                text_color2 = self.get_word_color()
+            else:
+                text_color2 = text_color
+            for i, c in enumerate(text):
+                if random.random() < self.cfg.second_font.change_rate and not self.fonts_by_image:
+                    y_offset = np.random.uniform(0, font2.getoffset(c)[1])
+                    draw.text((x, y + y_offset), c, fill=text_color2, font=font2)
+                    x += font2.getsize(c)[0]
+                else:
+                    if self.fonts_by_image:
+                        pil_img = self.mix_seamless_bg(font[c], pil_img, (x, y))
+                        x += font[c].shape[1]
+                    else:
+                        draw.text((x, y), c, fill=text_color, font=font)
+                        x += font.getsize(c)[0]
+        else:
+            if self.fonts_by_image:
+                # print("pil_img", pil_img.shape)
+                for c in text:
+                    pil_img = self.mix_seamless_bg(font[c], pil_img, (x, y))
+                    x += font[c].shape[1]
+            else:
+                draw.text((x, y), text, fill=text_color, font=font)
+        return pil_img
+
+    def draw_border_text(self, draw, text, x, y, font, text_color):
+        """
+        :param x/y: 应该是移除了 offset 的
+        """
+        # thickness larger than 1 may give bad border result
+        thickness = 1
+
+        choices = []
+        p = []
+        if self.cfg.text_border.light.enable:
+            choices.append(0)
+            p.append(self.cfg.text_border.light.fraction)
+        if self.cfg.text_border.dark.enable:
+            choices.append(1)
+            p.append(self.cfg.text_border.dark.fraction)
+
+        light_or_dark = np.random.choice(choices, p=p)
+
+        if light_or_dark == 0:
+            border_color = text_color + \
+                           np.random.randint(0, 255 - text_color - 1)
+        elif light_or_dark == 1:
+            border_color = text_color - np.random.randint(0, text_color + 1)
+
+        # thin border
+        draw.text((x - thickness, y), text, font=font, fill=border_color)
+        draw.text((x + thickness, y), text, font=font, fill=border_color)
+        draw.text((x, y - thickness), text, font=font, fill=border_color)
+        draw.text((x, y + thickness), text, font=font, fill=border_color)
+
+        # thicker border
+        draw.text((x - thickness, y - thickness),
+                  text, font=font, fill=border_color)
+        draw.text((x + thickness, y - thickness),
+                  text, font=font, fill=border_color)
+        draw.text((x - thickness, y + thickness),
+                  text, font=font, fill=border_color)
+        draw.text((x + thickness, y + thickness),
+                  text, font=font, fill=border_color)
+
+        # now draw the text over it
+        draw.text((x, y), text, font=font, fill=text_color)
+
+    def gen_bg(self, width, height):
+        bg = self.gen_bg_from_image(int(width), int(height))
+        return bg
+
+    def gen_bg_from_image(self, width, height):
+        """
+        Resize background, let bg_width>=width, bg_height >=height, and random crop from resized background
+        """
+        assert width > height
+
+        bg = random.choice(self.bgs)
+
+        scale = max(width / bg.shape[1], height / bg.shape[0])
+
+        rand_scale = scale * random.random()
+
+        scale = scale if width > rand_scale * bg.shape[1] else rand_scale
+
+        out = cv2.resize(bg, None, fx=scale, fy=scale)
+
+        x_offset, y_offset = self.random_xy_offset(
+            height, width, out.shape[0], out.shape[1])
+
+        out = out[y_offset:y_offset + height, x_offset:x_offset + width]
+
+        # out = self.apply_gauss_blur(out, ks=[7, 11, 13, 15, 17]) 尝试不再模糊背景
+
+        # TODO: find a better way to deal with background
+        # alpha = 255 / bg_mean  # 对比度
+        # beta = np.random.randint(bg_mean // 4, bg_mean // 2)  # 亮度
+        # out = np.uint8(np.clip((alpha * out + beta), 0, 255))
+
+        return out
+
+    # @debug
+    @retry
+    def pick_font(self, img_index):
+        """
+        :param img_index when use list corpus, this param is used
+        :return:
+            font: truetype
+            size: word size, removed offset (width, height)
+        """
+        word = self.corpus.get_sample(img_index)
+
+        if self.clip_max_chars and len(word) > self.max_chars:
+            word = word[:self.max_chars]
+
+        font_path = random.choice(self.fonts)
+        font_path_2 = random.choice(self.fonts)
+
+        if self.strict:
+            unsupport_chars = self.font_unsupport_chars[font_path]
+            # unsupport_chars.extend(self.font_unsupport_chars[font_path_2])
+            for c in word:
+                if c == ' ':
+                    continue
+                if c in unsupport_chars:
+                    print('Retry pick_font(), \'%s\' contains chars \'%s\' not supported by font %s' % (
+                        word, c, font_path))
+                    raise Exception
+
+        # Font size in point
+        font_size = random.randint(
+            self.cfg.font_size.min, self.cfg.font_size.max)
+        if self.fonts_by_image:
+            font = self.loads_fonts_by_image(font_path, font_size)
+        else:
+            font = ImageFont.truetype(font_path, font_size)
+        if self.cfg.second_font.font_size_change:
+            font_size_2 = font_size - random.randint(1, 10)
+        else:
+            font_size_2 = font_size
+        if self.cfg.second_font.font_change:
+            if self.fonts_by_image:
+                font2 = self.loads_fonts_by_image(font_path_2, font_size_2)
+            else:
+                font2 = ImageFont.truetype(font_path_2, font_size_2)
+        else:
+            if self.fonts_by_image:
+                font2 = self.loads_fonts_by_image(font_path, font_size_2)
+            else:
+                font2 = ImageFont.truetype(font_path, font_size_2)
+
+        return word, font, self.get_word_size(font, word, font_size), font2, font_size
+
+    def loads_fonts_by_image(self, font_path, font_size):
+        fonts = {}
+        for x in os.listdir(font_path):
+            img = cv2.imdecode(np.fromfile(font_path + "/" + x, dtype=np.uint8), cv2.IMREAD_COLOR)
+            h, w = img.shape[:2]
+            fonts[x.replace(".png", "")] = cv2.resize(img, (font_size, h * font_size // w))
+        return fonts
+
+    def get_word_size(self, font, word, default=None):
+        """
+        Get word size removed offset
+        :param font: truetype
+        :param word:
+        :return:
+            size: word size, removed offset (width, height)
+        """
+        if self.fonts_by_image:
+            offset = (0, 0)
+            w_list, h_list = [], []
+            for c in word:
+                if c in font:
+                    h, w = font[c].shape[:2]
+                else:
+                    h, w = default, default
+                w_list.append(w)
+                h_list.append(h)
+            size = (sum(w_list), max(h_list))
+        else:
+            offset = font.getoffset(word)
+            size = font.getsize(word)
+        size = (size[0] - offset[0], size[1] - offset[1])
+        return size
+
+    # @debug
+    def apply_perspective_transform(self, img, text_box_pnts, max_x, max_y, max_z, gpu=False):
+        """
+        Apply perspective transform on image
+        :param img: origin numpy image
+        :param text_box_pnts: four corner points of text
+        :param x: max rotate angle around X-axis
+        :param y: max rotate angle around Y-axis
+        :param z: max rotate angle around Z-axis
+        :return:
+            dst_img:
+            dst_img_pnts: points of whole word image after apply perspective transform
+            dst_text_pnts: points of text after apply perspective transform
+        """
+
+        x = math_utils.cliped_rand_norm(0, max_x)
+        y = math_utils.cliped_rand_norm(0, max_y)
+        z = math_utils.cliped_rand_norm(0, max_z)
+
+        # print("x: %f, y: %f, z: %f" % (x, y, z))
+
+        transformer = math_utils.PerspectiveTransform(
+            x, y, z, scale=1.0, fovy=50)
+
+        dst_img, M33, dst_img_pnts = transformer.transform_image(img, gpu)
+        dst_text_pnts = transformer.transform_pnts(text_box_pnts, M33)
+
+        return dst_img, dst_img_pnts, dst_text_pnts
+
+    def apply_blur_on_output(self, img):
+        p = []
+        funcs = []
+        if self.cfg.blur.gauss.enable:
+            p.append(self.cfg.blur.gauss.fraction)
+            funcs.append(self.apply_gauss_blur)
+
+        if self.cfg.blur.norm.enable:
+            p.append(self.cfg.blur.norm.fraction)
+            funcs.append(self.apply_norm_blur)
+
+        if self.cfg.blur.motion.enable:
+            p.append(self.cfg.blur.motion.fraction)
+            funcs.append(self.apply_motion_blur)
+
+        if self.cfg.blur.prydown.enable:
+            p.append(self.cfg.blur.prydown.fraction)
+            funcs.append(self.apply_prydown)
+
+        if len(p) == 0:
+            return img
+
+        blur_func = np.random.choice(funcs, p=p)
+
+        return blur_func(img)
+
+    def apply_gauss_blur(self, img, ks=None):
+        if ks is None:
+            ks = [7, 9, 11, 13]
+        ksize = random.choice(ks)
+
+        sigmas = [0, 1, 2, 3, 4, 5, 6, 7]
+        sigma = 0
+        if ksize <= 3:
+            sigma = random.choice(sigmas)
+        img = cv2.GaussianBlur(img, (ksize, ksize), sigma)
+        return img
+
+    def apply_norm_blur(self, img, ks=None):
+        # kernel == 1, the output image will be the same
+        if ks is None:
+            ks = [2, 3]
+        kernel = random.choice(ks)
+        img = cv2.blur(img, (kernel, kernel))
+        return img
+
+    def apply_motion_blur(self, img, ks=None, angle=None):
+        if ks is None:
+            ks = [7, 9, 11, 13]
+        ksize = random.choice(ks)
+        if angle is None:
+            angle = random.randint(0, 360)
+        kernel = np.zeros((ksize, ksize), dtype=np.float32)
+        kernel[(ksize - 1) // 2, :] = np.ones(ksize, dtype=np.float32)
+        kernel = cv2.warpAffine(kernel, cv2.getRotationMatrix2D((ksize / 2 - 0.5, ksize / 2 - 0.5), angle, 1.0),
+                                (ksize, ksize))
+        kernel = kernel * (1.0 / np.sum(kernel))
+        img = cv2.filter2D(img, -1, kernel)
+        return img
+
+    def apply_prydown(self, img):
+        """
+        模糊图像，模拟小图片放大的效果
+        """
+        scale = random.uniform(
+            1, self.cfg.blur.prydown.max_scale)  # todo: use different h/w scale
+        height = img.shape[0]
+        width = img.shape[1]
+
+        out = cv2.resize(
+            img, (int(width / scale), int(height / scale)), interpolation=cv2.INTER_AREA)
+        return cv2.resize(out, (width, height), interpolation=cv2.INTER_AREA)
+
+    def reverse_img(self, word_img):
+        offset = np.random.randint(-10, 10)
+        return 255 + offset - word_img
+
+    def create_kernals(self):
+        self.emboss_kernal = np.array([
+            [-2, -1, 0],
+            [-1, 1, 1],
+            [0, 1, 2]
+        ])
+
+        self.sharp_kernel = np.array([
+            [-1, -1, -1],
+            [-1, 9, -1],
+            [-1, -1, -1]
+        ])
+
+    def apply_emboss(self, word_img):
+        return cv2.filter2D(word_img, -1, self.emboss_kernal)
+
+    def apply_sharp(self, word_img):
+        return cv2.filter2D(word_img, -1, self.sharp_kernel)
+
+    # @debug
+    def apply_crop(self, text_box_pnts, crop_cfg):
+        """
+        Random crop text box height top or bottom, we don't need image information in this step, only change box pnts
+        :param text_box_pnts: bbox of text [left-top, right-top, right-bottom, left-bottom]
+        :param crop_cfg:
+        :return:
+            croped_text_box_pnts
+        """
+        height = abs(text_box_pnts[0][1] - text_box_pnts[3][1])
+        scale = float(height) / float(self.out_height)
+
+        croped_text_box_pnts = text_box_pnts
+
+        if prob(0.5):
+            top_crop = int(random.randint(
+                crop_cfg.top.min, crop_cfg.top.max) * scale)
+            self.dmsg("top crop %d" % top_crop)
+            croped_text_box_pnts[0][1] += top_crop
+            croped_text_box_pnts[1][1] += top_crop
+        else:
+            bottom_crop = int(random.randint(
+                crop_cfg.bottom.min, crop_cfg.bottom.max) * scale)
+            self.dmsg("bottom crop %d " % bottom_crop)
+            croped_text_box_pnts[2][1] -= bottom_crop
+            croped_text_box_pnts[3][1] -= bottom_crop
+
+        return croped_text_box_pnts

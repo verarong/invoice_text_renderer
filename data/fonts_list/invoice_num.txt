@@ -1,0 +1,10 @@
+./data/fonts/chn/taxi_0
+./data/fonts/chn/taxi_1
+./data/fonts/chn/taxi_2
+./data/fonts/chn/taxi_3
+./data/fonts/chn/taxi_4
+./data/fonts/chn/taxi_5
+./data/fonts/chn/taxi_6
+./data/fonts/chn/taxi_7
+./data/fonts/chn/taxi_8
+./data/fonts/chn/taxi_9
